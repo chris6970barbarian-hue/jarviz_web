@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     JARVIZ_LLM_PROVIDER: str = "deepseek"
     JARVIZ_LLM_MODEL: str = "deepseek-v4-flash"
     JARVIZ_LLM_MAX_TOKENS: int = 512
+    # Transient-failure retries (429 / 5xx / connection drops) per LLM call.
+    # Passed to the OpenAI-compatible client, which retries with exponential
+    # backoff honoring Retry-After. 0 disables; 2 is the SDK's own default.
+    JARVIZ_LLM_MAX_RETRIES: int = 2
 
     # DeepSeek (OpenAI-compatible API)
     DEEPSEEK_API_KEY: str = ""
@@ -48,8 +52,30 @@ class Settings(BaseSettings):
     JARVIZ_TTS_VOICE: str = "en-US-GuyNeural"
     JARVIZ_TTS_RATE: str = "+0%"
 
+    # Real-time TTS pacing. Edge-TTS -> ffmpeg decodes audio far faster than
+    # real-time, and `_stream_tts` would otherwise fire every 60 ms Opus frame
+    # at the device in one burst. The firmware's decode queue only holds
+    # ~2.4 s (MAX_DECODE_PACKETS_IN_QUEUE = 2400/60 = 40 frames) and drops
+    # everything past that (PushPacketToDecodeQueue default wait=false), so a
+    # long reply gets cut off mid-sentence. We instead pace the send so we
+    # never run more than JARVIZ_TTS_JITTER_BUFFER_MS ahead of real-time
+    # playback — keeping the device queue full enough to never underrun but
+    # far enough below the cap to never drop. Set ENABLED=false only if you
+    # point the device at a server that already paces (real xiaozhi.me does).
+    JARVIZ_TTS_PACING_ENABLED: bool = True
+    # How far ahead of real-time playback we may get, in ms. Doubles as the
+    # jitter buffer (the device can absorb this much network jitter without a
+    # gap). Must stay well under the firmware's 2400 ms decode-queue cap;
+    # 800 ms leaves ~1.6 s of headroom.
+    JARVIZ_TTS_JITTER_BUFFER_MS: int = 800
+
     JARVIZ_DATA_DIR: str = "./data"
     JARVIZ_LOG_LEVEL: str = "INFO"
+    # Whether to log the actual text of device utterances / assistant replies
+    # (the `RX listen`, `Listen detect`, `Assistant ->` lines). Useful while
+    # debugging; a privacy/PII liability in production logs. Set false to
+    # redact the content (lengths still logged) for a compliant deployment.
+    JARVIZ_LOG_MESSAGE_TEXT: bool = True
 
     # Optional shared secret for HMAC-signed device tokens. When empty (the
     # default) the server runs without auth — fine for a LAN-only prototype.
@@ -66,6 +92,20 @@ class Settings(BaseSettings):
     # Useful for development boards or trusted on-prem devices that you
     # don't want to mint tokens for.
     JARVIZ_AUTH_ALLOWED_DEVICES: str = ""
+    # Fail-closed switch. When true the server REFUSES to start unless
+    # JARVIZ_AUTH_SECRET is set — so a misconfigured prod deploy can't
+    # silently come up with device auth disabled. Default false preserves
+    # the open LAN-prototype behavior.
+    JARVIZ_REQUIRE_AUTH: bool = False
+    # Operator-console / telemetry credential. When set, all dashboard +
+    # telemetry GET routes (/dashboard, /metrics, /transcripts/recent,
+    # /logs/recent, /sessions/live, /network, /reminders/stats, /devices)
+    # require this token — supplied as `?token=`, an `X-Dashboard-Token`
+    # header, or the `jarviz_dash` cookie that /dashboard?token=... sets.
+    # Empty (default) keeps those routes open (LAN-prototype behavior); the
+    # startup guard warns when that combines with a non-loopback bind.
+    # /healthz and the device OTA/WS routes are never gated by this.
+    JARVIZ_DASHBOARD_TOKEN: str = ""
 
     # Hard cap on concurrent WebSocket sessions. Idle WS connections are
     # cheap (a buffer per socket); this exists mostly to prevent a buggy
@@ -97,6 +137,12 @@ class Settings(BaseSettings):
     # loosen or, on fleet deployments, tighten.
     JARVIZ_WS_PING_INTERVAL_S: float = 20.0
     JARVIZ_WS_PING_TIMEOUT_S: float = 20.0
+
+    # Graceful-shutdown budget (seconds) on SIGTERM/SIGINT. uvicorn stops
+    # accepting new connections and lets in-flight turns finish (so a deploy
+    # restart doesn't clip a reply mid-sentence) up to this long before
+    # force-closing. Keep it a touch above a typical turn's TTS duration.
+    JARVIZ_WS_GRACEFUL_SHUTDOWN_S: float = 10.0
 
     # Per-device cooldown. A given Device-Id can only open a new WS or
     # OTA request once every N seconds; faster reconnects are rejected.

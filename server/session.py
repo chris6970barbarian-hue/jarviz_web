@@ -29,6 +29,7 @@ from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from .audio import (
+    FRAME_DURATION_MS,
     MIC_SAMPLE_RATE,
     OpusMicDecoder,
     OpusTtsEncoder,
@@ -95,6 +96,32 @@ def _sanitize_for_tts(text: str) -> str:
     # (e.g. "fresh 👋 here" -> "fresh  here" -> "fresh here").
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned.strip()
+
+
+def _log_text(text: str | None) -> str:
+    """Redact free-text in logs when JARVIZ_LOG_MESSAGE_TEXT is off, so a
+    production log (and the in-memory ring behind /logs/recent) carries no
+    user/assistant PII. The length is kept so lines stay debuggable."""
+    if text is None:
+        return ""
+    if settings.JARVIZ_LOG_MESSAGE_TEXT:
+        return text
+    # A protocol-violating device could send a non-string `text` (e.g. an int).
+    # Don't call len() on it — that TypeError would otherwise escape the RX-log
+    # line and tear down the whole session on the redaction path.
+    if not isinstance(text, str):
+        return f"<redacted {type(text).__name__}>"
+    return f"<redacted {len(text)} chars>"
+
+
+def _redact_msg(msg: dict) -> dict:
+    """A copy of an inbound device message with its free-text field redacted
+    (for the RX log line) when JARVIZ_LOG_MESSAGE_TEXT is off."""
+    if settings.JARVIZ_LOG_MESSAGE_TEXT or "text" not in msg:
+        return msg
+    clone = dict(msg)
+    clone["text"] = _log_text(clone.get("text"))
+    return clone
 
 
 @dataclass
@@ -321,7 +348,7 @@ class Session:
         # MCP traffic is its own logger and would drown out the listen events
         # we care about for the cut-off-mid-sentence diagnosis.
         if mtype != "mcp":
-            log.info("RX %s: %s", mtype, msg)
+            log.info("RX %s: %s", mtype, _redact_msg(msg))
         if mtype == "listen":
             await self._on_listen(msg)
         elif mtype == "abort":
@@ -403,7 +430,7 @@ class Session:
             self._spawn_process(captured_pcm=buf, source_text=None)
         elif state == "detect":
             text = (msg.get("text") or "").strip()
-            log.info("Listen detect: %r", text)
+            log.info("Listen detect: %r", _log_text(text))
             if text.startswith(REMINDER_PREFIX):
                 # Bump the dashboard's "reminder fired" counter — this is
                 # the proactive path where ReminderManager::Tick on the
@@ -427,6 +454,9 @@ class Session:
         # Cancel any in-flight turn before starting a new one.
         if self._state.process_task and not self._state.process_task.done():
             self._state.process_task.cancel()
+        # Clean slate for the echo-guard: a suppressed-start flag must never
+        # leak across a turn boundary and swallow the next genuine listen.stop.
+        self._state.suppress_listen = False
         self._state.process_task = asyncio.create_task(
             self._process_turn(captured_pcm, source_text)
         )
@@ -461,6 +491,7 @@ class Session:
                     user_text = await self._asr.transcribe(captured_pcm, MIC_SAMPLE_RATE)
                 except Exception as e:  # noqa: BLE001
                     log.exception("ASR failed: %s", e)
+                    metrics_inc("asr_failed")
                     user_text = ""
                 finally:
                     # In `finally` so cancellation mid-ASR still reports the
@@ -554,6 +585,7 @@ class Session:
                         )
                     except Exception as e:  # noqa: BLE001
                         log.exception("LLM failed: %s", e)
+                        metrics_inc("llm_failed")
                         assistant_text = "Sorry, something went wrong on my end."
                         new_history = self._state.history
                     finally:
@@ -573,16 +605,22 @@ class Session:
                 if spoken_text != assistant_text:
                     log.debug("TTS sanitizer trimmed %d -> %d chars",
                               len(assistant_text), len(spoken_text))
-                log.info("Assistant -> %r", spoken_text)
+                log.info("Assistant -> %r", _log_text(spoken_text))
                 assistant_text_for_log = spoken_text
 
                 t0 = time.monotonic()
                 tts_entered = True
                 live_state.set_state(self._session_id, live_state.STATE_SPEAKING)
                 try:
-                    await self._stream_tts(spoken_text)
+                    frames = await self._stream_tts(spoken_text)
+                    # We had text to say but no audio reached the device — an
+                    # upstream TTS failure (e.g. Edge outage). Count it so the
+                    # operator sees a TTS error rate, not just silence.
+                    if spoken_text.strip() and not frames:
+                        metrics_inc("tts_failed")
                 except Exception as e:  # noqa: BLE001
                     log.exception("TTS streaming failed at session level: %s", e)
+                    metrics_inc("tts_failed")
                 finally:
                     # Captured in `finally` so a mid-TTS abort still records the
                     # time spent streaming rather than reporting 0ms.
@@ -599,7 +637,13 @@ class Session:
             # leaves it in auto-listening mode otherwise, which would sit
             # with the mic open forever.
             if source_text and source_text.startswith(REMINDER_PREFIX):
-                await asyncio.sleep(0.2)
+                # With real-time pacing, up to JARVIZ_TTS_JITTER_BUFFER_MS of
+                # audio is still buffered on the device when _stream_tts
+                # returns. Closing the channel doesn't clear the device's
+                # queue (it drains regardless of state), but wait out the
+                # cushion plus a margin so the close can never race the tail.
+                drain_s = settings.JARVIZ_TTS_JITTER_BUFFER_MS / 1000.0 + 0.3
+                await asyncio.sleep(drain_s)
                 await self._safe_close()
         except asyncio.CancelledError:
             log.info("Turn cancelled mid-flight")
@@ -655,9 +699,12 @@ class Session:
             # entirely if/when the WS drops.)
             live_state.set_state(self._session_id, live_state.STATE_IDLE)
 
-    async def _stream_tts(self, text: str) -> None:
+    async def _stream_tts(self, text: str) -> int:
+        """Stream `text` as paced Opus frames. Returns the number of audio
+        frames sent (0 means nothing was synthesized — e.g. an upstream TTS
+        failure — which the caller treats as a TTS error)."""
         if not text.strip():
-            return
+            return 0
         await self._send_json(
             {"type": "tts", "state": "sentence_start", "text": text}
         )
@@ -670,6 +717,36 @@ class Session:
         frames_sent = 0
         bytes_sent = 0
         tts_t0 = time.monotonic()
+
+        # --- Real-time pacing -------------------------------------------------
+        # Without this we'd flush the whole reply (encoded faster than
+        # real-time) at the device in one burst. The firmware's decode queue
+        # only holds ~2.4s and drops everything past that, so a long reply gets
+        # cut off mid-sentence. Gate each frame so we never run more than
+        # `lead_seconds` ahead of its real-time playout point: the first
+        # `lead_seconds` of audio burst out to prime the device's jitter
+        # buffer, then we settle to one frame per `frame_seconds`. The schedule
+        # is absolute (off `tts_t0`) so per-frame send cost can't accumulate
+        # into drift.
+        pace = settings.JARVIZ_TTS_PACING_ENABLED
+        frame_seconds = FRAME_DURATION_MS / 1000.0
+        lead_seconds = max(0.0, settings.JARVIZ_TTS_JITTER_BUFFER_MS / 1000.0)
+
+        async def _emit(opus: bytes) -> None:
+            nonlocal frames_sent, bytes_sent
+            # Pace BEFORE the send. The sleep is a cancellation point, so an
+            # abort / barge-in stops the stream within ~one frame instead of
+            # after the full flood. It is also outside `_send_bytes` so it
+            # never holds the WS send lock.
+            if pace:
+                target = tts_t0 + frames_sent * frame_seconds - lead_seconds
+                delay = target - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            await self._send_bytes(opus)
+            frames_sent += 1
+            bytes_sent += len(opus)
+
         try:
             async for pcm_chunk in self._tts.synthesize(text):
                 leftover.extend(pcm_chunk)
@@ -677,15 +754,11 @@ class Session:
                     frame = bytes(leftover[:bytes_per_frame])
                     del leftover[:bytes_per_frame]
                     for opus in self._tts_encoder.encode_pcm(frame):
-                        await self._send_bytes(opus)
-                        frames_sent += 1
-                        bytes_sent += len(opus)
+                        await _emit(opus)
             if leftover:
                 # Encode the trailing partial frame (encoder pads internally).
                 for opus in self._tts_encoder.encode_pcm(bytes(leftover)):
-                    await self._send_bytes(opus)
-                    frames_sent += 1
-                    bytes_sent += len(opus)
+                    await _emit(opus)
         except Exception as e:  # noqa: BLE001
             log.exception("TTS streaming failed: %s", e)
         finally:
@@ -696,3 +769,4 @@ class Session:
                 frames_sent * 60 / 1000.0,
             )
             await self._send_json({"type": "tts", "state": "stop"})
+        return frames_sent
