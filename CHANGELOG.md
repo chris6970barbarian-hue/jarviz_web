@@ -5,6 +5,87 @@ change. For details, see the linked commit.
 
 ## Unreleased
 
+### Security & resilience hardening (round 2)
+- **Operator console / telemetry now gated** by `JARVIZ_DASHBOARD_TOKEN`. When
+  set, `/dashboard` + every telemetry GET (`/metrics`, `/transcripts/recent`,
+  `/logs/recent`, `/sessions/live`, `/network`, `/reminders/stats`, `/devices`)
+  requires the token (via `?token=`, `X-Dashboard-Token` header, or the
+  `jarviz_dash` HttpOnly/SameSite=strict cookie that `/dashboard?token=...`
+  sets — so the page's same-origin polling authenticates with no JS change).
+  Empty = open (LAN-dev default). `/healthz` and device OTA/WS routes are never
+  gated. Closes the unauthenticated-read-surface finding.
+- **Fail-closed option** `JARVIZ_REQUIRE_AUTH`: refuse to boot unless
+  `JARVIZ_AUTH_SECRET` is set, so a prod deploy can't silently come up open.
+- **LLM transient-failure retries**: `JARVIZ_LLM_MAX_RETRIES` (default 2) wired
+  into the OpenAI-compatible client — a routine 429/5xx no longer wastes a turn.
+- **Graceful shutdown**: `JARVIZ_WS_GRACEFUL_SHUTDOWN_S` (default 10) lets
+  uvicorn drain in-flight turns on SIGTERM instead of clipping a reply.
+- **Per-stage failure metrics**: `/metrics` now reports `failures.{asr,llm,tts}`
+  so operators can alert on an error rate, not just the started/completed gap.
+  A TTS turn that yields zero audio (silent Edge failure) increments `tts`.
+- **PII log control**: `JARVIZ_LOG_MESSAGE_TEXT` (default true) — set false to
+  redact utterance/reply text from logs and the `/logs/recent` ring.
+- **Echo-guard**: `suppress_listen` is reset on each new turn so a stale flag
+  can't leak across a turn boundary and drop the next genuine `listen.stop`.
+- Test suite grows to **86 tests** (dashboard-auth gating, retry wiring,
+  fail-closed boot, failure metrics, redaction, echo-guard reset). Live-verified
+  against a running server (telemetry 401/200 gating, cookie, startup warning).
+- An adversarial review of this diff found three issues, all fixed here:
+  (1) the open-telemetry startup warning now also fires when only the dashboard
+  token is missing (previously it required device auth to also be off);
+  (2) the `jarviz_dash` cookie now sets `Secure` on a TLS (wss/https) deploy;
+  (3) `_log_text` no longer crashes the session on a non-string `text` field
+  when redaction is on.
+
+### Test suite + production-readiness hardening
+- **First automated test suite** (`tests/`, 64 tests, offline/deterministic):
+  pacing schedule, Session state machine + echo-guard + abort + turn-semaphore
+  release, auth HMAC, cooldown, opus round-trip, MCP bridge, metrics, the
+  sanitizer, FastAPI HTTP/WS surface incl. auth accept/reject, an end-to-end
+  protocol smoke over a real WebSocket, and Edge-TTS failure resilience. Runs
+  with stub providers — no key/network/model. See `tests/README.md`.
+- **Fixed phantom dependency pin**: `requests==2.33.1` (does not exist on
+  PyPI — every fresh `pip install`/Docker build failed) → `requests==2.32.3`.
+- **Fixed docker-compose data loss**: the app writes to `/tmp/jarviz-data`
+  (image default) but compose mounted `./data:/data`, so the device registry
+  was wiped on every container recreate. Compose now sets
+  `JARVIZ_DATA_DIR=/data` so the mounted volume is actually used.
+- **Edge-TTS failures are no longer silent**: an upstream stream error
+  (Edge CDN 403 / network drop / NoAudioReceived) was swallowed, so the device
+  played silence with no log. It is now logged with the byte count produced
+  before failure, so operators can tell silence-by-request from a broken Edge.
+- **Security-posture startup guard**: logs a loud WARNING when device auth is
+  disabled, and an explicit "bound to a non-loopback interface" warning when
+  that combines with a routable `JARVIZ_HTTP_HOST` (the fail-open default).
+- **Dockerfile HEALTHCHECK** added for orchestrators that read it.
+- See the maturity audit for the remaining backlog (unauthenticated telemetry
+  surface, replayable tokens, LLM retry/backoff, graceful shutdown).
+
+### Real-time TTS pacing — fixes the *real* "cut off mid-sentence" cause
+- **Root cause** (the one the echo-guard missed): `_stream_tts` sent every
+  60 ms Opus frame in a tight loop with no pacing. Edge-TTS → ffmpeg decodes
+  far faster than real-time, so a multi-second reply was flung at the device
+  in a fraction of a second. The firmware's decode queue only holds ~2.4 s
+  (`MAX_DECODE_PACKETS_IN_QUEUE = 2400/60 = 40` frames) and pushes with
+  `wait=false`, so every frame past the cap was *silently dropped before being
+  decoded*. The device played the first ~2.5–3.5 s and went silent — every
+  time, on any reply longer than a couple seconds. The earlier echo-guard
+  addressed a different mechanism (auto-listen VAD cancelling the turn) and
+  never touched frame delivery, which is why the cutoff persisted.
+- **Fix in `_stream_tts`**: pace each frame against an absolute (drift-free)
+  schedule so we never run more than `JARVIZ_TTS_JITTER_BUFFER_MS` (default
+  800 ms) ahead of its real-time playout point. The device's queue now stays
+  comfortably full and far below the drop cap, and the closing `tts stop`
+  arrives at the true end of the audio. Real `xiaozhi.me` paces the same way;
+  the firmware is stock-upstream and unchanged.
+- Bonus: the pace `sleep` is a cancellation point, so a barge-in / `abort` now
+  stops the stream within ~one frame instead of after the whole flood — and
+  the turn stays "active" for the real playback duration, closing a timing
+  hole that let the echo-guard's `_is_turn_active()` flip to False mid-speech.
+- New tunables in `config.py` / `.env.example`: `JARVIZ_TTS_PACING_ENABLED`
+  (master switch) and `JARVIZ_TTS_JITTER_BUFFER_MS`. The proactive-reminder
+  channel-close now waits out the jitter buffer before closing.
+
 ### Operator console refresh (v2)
 - **Audiophile mission-control aesthetic.** `dashboard.py` rewritten from
   the spartan grid into a designed interface: warm near-black panel,

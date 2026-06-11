@@ -33,6 +33,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8080
 
+# Liveness probe for orchestrators that read image HEALTHCHECK (docker run,
+# Swarm, some PaaS). docker-compose declares its own; this covers the rest.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz').status==200 else 1)"
+
 # `python -m server` wraps uvicorn with our defaults (WS keepalive, host/port
 # from .env). Falling back to plain `uvicorn` works too — see server/__main__.py.
 CMD ["python", "-m", "server"]

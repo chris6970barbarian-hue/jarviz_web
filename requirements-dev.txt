@@ -1,0 +1,26 @@
+# Dev / CI dependencies — enough to run the offline test suite.
+#
+# The tests stub the ASR/LLM/TTS providers, so the heavy ML stack from
+# requirements.txt (faster-whisper / ctranslate2 / PyOgg) is intentionally
+# NOT needed here — this keeps `pytest` fast and reliable in CI. Versions
+# track requirements.txt where they overlap.
+#
+# System packages still required at test time: libopus (server.audio binds it
+# via ctypes) and ffmpeg (the Edge-TTS resilience tests spawn it). CI installs
+# them with apt; locally use `brew install opus ffmpeg` (macOS) or the distro
+# equivalent.
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+pydantic-settings==2.6.0
+websockets==13.1
+edge-tts>=7.0.0,<8
+numpy==1.26.4
+httpx==0.27.2
+filelock>=3.13,<4
+imageio-ffmpeg==0.5.1
+python-dotenv
+python-multipart==0.0.12
+openai==1.54.0
+pytest>=8,<10
+pytest-asyncio>=0.24,<2

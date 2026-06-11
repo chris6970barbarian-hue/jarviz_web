@@ -32,6 +32,10 @@ def main() -> None:
         # own 20s/20s defaults, but settings.* let operators tune it.
         ws_ping_interval=settings.JARVIZ_WS_PING_INTERVAL_S,
         ws_ping_timeout=settings.JARVIZ_WS_PING_TIMEOUT_S,
+        # On SIGTERM (deploy/restart) stop accepting new connections and let
+        # in-flight turns finish before force-closing, so a redeploy doesn't
+        # clip a reply mid-sentence. Bounded so a wedged turn can't block exit.
+        timeout_graceful_shutdown=int(settings.JARVIZ_WS_GRACEFUL_SHUTDOWN_S),
         # Reload only when explicitly opted in; production should never
         # auto-reload (it tears down WS sessions on every file save).
         reload=False,

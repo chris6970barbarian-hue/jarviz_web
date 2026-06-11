@@ -8,6 +8,12 @@ services:
       - "8080:8080"
     env_file:
       - .env
+    # The image's default JARVIZ_DATA_DIR is /tmp/jarviz-data (chosen for
+    # HF Spaces, which has no persistent volume). For compose we DO persist:
+    # point the data dir at the mounted volume so devices.json survives
+    # `docker compose down`/recreate. `environment` overrides `env_file`.
+    environment:
+      - JARVIZ_DATA_DIR=/data
     volumes:
       - ./data:/data
     healthcheck:

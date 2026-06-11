@@ -15,10 +15,11 @@ flow here later.
 
 from __future__ import annotations
 
+import hmac
 import logging
 import time
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 
 from .auth import mint_token
@@ -37,6 +38,76 @@ from .store import list_devices, touch_device
 log = logging.getLogger("jarviz.ota")
 router = APIRouter()
 
+# --- Operator-console / telemetry auth ------------------------------------
+# When JARVIZ_DASHBOARD_TOKEN is set, the dashboard + telemetry read surface
+# (which exposes transcripts, device IDs, peer IPs, and logs) requires the
+# token. The token is accepted as `?token=`, an `X-Dashboard-Token` header,
+# or the `jarviz_dash` cookie that the dashboard page sets on a good token —
+# so the browser's same-origin polling fetches authenticate via the cookie
+# with no client-side code. /healthz and the device OTA/WS routes are NEVER
+# gated by this (probes + devices must reach them freely).
+_DASH_COOKIE = "jarviz_dash"
+
+
+def _dashboard_token_ok(request: Request) -> bool:
+    configured = settings.JARVIZ_DASHBOARD_TOKEN
+    if not configured:
+        return True  # open (LAN-prototype default)
+    supplied = (
+        request.query_params.get("token")
+        or request.headers.get("x-dashboard-token")
+        or request.cookies.get(_DASH_COOKIE)
+        or ""
+    )
+    return bool(supplied) and hmac.compare_digest(supplied, configured)
+
+
+async def dashboard_guard(request: Request) -> None:
+    """FastAPI dependency for the JSON telemetry endpoints."""
+    if not _dashboard_token_ok(request):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="operator token required (set ?token=, X-Dashboard-Token, or visit /dashboard?token=...)",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+_LOGIN_HINT = (
+    "<!doctype html><meta charset=utf-8><title>Jarviz — auth required</title>"
+    "<body style='font-family:system-ui;background:#16130f;color:#e8dcc8;"
+    "padding:3rem;max-width:40rem;margin:auto'>"
+    "<h1>Operator token required</h1><p>This console is protected. Open it as "
+    "<code>/dashboard?token=YOUR_TOKEN</code> (the value of "
+    "<code>JARVIZ_DASHBOARD_TOKEN</code>).</p></body>"
+)
+
+
+def _serve_dashboard(request: Request) -> HTMLResponse:
+    """Serve the console; on a valid token, drop a cookie so the page's
+    same-origin polling fetches authenticate without extra client code."""
+    if not _dashboard_token_ok(request):
+        return HTMLResponse(content=_LOGIN_HINT, status_code=status.HTTP_401_UNAUTHORIZED)
+    resp = HTMLResponse(content=DASHBOARD_HTML)
+    if settings.JARVIZ_DASHBOARD_TOKEN:
+        # Set Secure on a TLS deployment so the token cookie is never sent over
+        # plaintext, while the LAN-over-HTTP prototype (the default) still works.
+        # Detect TLS from the request scheme OR a wss:// public URL (covers a
+        # TLS-terminating proxy that forwards plain HTTP to us).
+        secure = (
+            request.url.scheme == "https"
+            or settings.JARVIZ_WS_PUBLIC_URL.lower().startswith("wss")
+        )
+        resp.set_cookie(
+            _DASH_COOKIE,
+            settings.JARVIZ_DASHBOARD_TOKEN,
+            max_age=86400,
+            httponly=True,
+            samesite="strict",
+            secure=secure,
+            path="/",
+        )
+    return resp
+
 
 @router.get("/")
 async def root(request: Request):
@@ -45,7 +116,7 @@ async def root(request: Request):
     OTA layer used to return at this path."""
     accept = request.headers.get("accept", "")
     if "text/html" in accept:
-        return HTMLResponse(content=DASHBOARD_HTML)
+        return _serve_dashboard(request)
     return {"service": "jarviz-backend", "status": "ok"}
 
 
@@ -54,13 +125,13 @@ async def healthz() -> dict:
     return {"ok": True}
 
 
-@router.get("/devices")
+@router.get("/devices", dependencies=[Depends(dashboard_guard)])
 async def devices() -> dict:
     """Read-only view of registered devices. Handy during prototyping."""
     return list_devices()
 
 
-@router.get("/metrics")
+@router.get("/metrics", dependencies=[Depends(dashboard_guard)])
 async def metrics() -> dict:
     """In-memory operator metrics — counters since process start and a
     p50/p95 of the most recent turn latencies. Per-worker; if you run
@@ -68,7 +139,7 @@ async def metrics() -> dict:
     return metrics_snapshot()
 
 
-@router.get("/logs/recent")
+@router.get("/logs/recent", dependencies=[Depends(dashboard_guard)])
 async def logs_recent(n: int = 200) -> dict:
     """Last `n` log records from the in-memory ring (formatted line +
     structured fields). Used by the operator dashboard to render a live
@@ -78,7 +149,7 @@ async def logs_recent(n: int = 200) -> dict:
     return {"records": recent_log_records(n)}
 
 
-@router.get("/sessions/live")
+@router.get("/sessions/live", dependencies=[Depends(dashboard_guard)])
 async def sessions_live() -> dict:
     """Current open WebSocket sessions with their per-device state
     (idle / listening / processing / speaking) and connection metadata.
@@ -86,14 +157,14 @@ async def sessions_live() -> dict:
     return {"sessions": live_sessions()}
 
 
-@router.get("/transcripts/recent")
+@router.get("/transcripts/recent", dependencies=[Depends(dashboard_guard)])
 async def transcripts_recent(n: int = 50) -> dict:
     """Last N completed conversation turns with both sides + tool calls."""
     n = max(1, min(int(n), 100))
     return {"transcripts": recent_transcripts(n)}
 
 
-@router.get("/reminders/stats")
+@router.get("/reminders/stats", dependencies=[Depends(dashboard_guard)])
 async def reminders_stats() -> dict:
     """Cumulative counters + per-hour series for the dashboard chart.
     `hourly` always spans the last 48 hours with zero-fill so the chart
@@ -101,7 +172,7 @@ async def reminders_stats() -> dict:
     return reminder_snapshot()
 
 
-@router.get("/network")
+@router.get("/network", dependencies=[Depends(dashboard_guard)])
 async def network() -> dict:
     """Server's own LAN addresses, the configured WS public URL handed
     to devices on OTA, the listen port, and the peer IPs of currently-
@@ -142,12 +213,12 @@ async def network() -> dict:
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard() -> HTMLResponse:
-    """Single-page operator dashboard. Polls /metrics and /logs/recent
-    every 2s and renders counters + recent latency + a live log tail.
-    No build pipeline; the HTML/CSS/JS is one Python string in
-    server/dashboard.py."""
-    return HTMLResponse(content=DASHBOARD_HTML)
+async def dashboard(request: Request) -> HTMLResponse:
+    """Single-page operator dashboard. Polls the telemetry endpoints every
+    2s. When JARVIZ_DASHBOARD_TOKEN is set, requires `?token=...` (and then
+    sets a cookie so the polling fetches authenticate). No build pipeline;
+    the HTML/CSS/JS is one Python string in server/dashboard.py."""
+    return _serve_dashboard(request)
 
 
 def _server_time() -> dict:

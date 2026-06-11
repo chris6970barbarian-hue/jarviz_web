@@ -47,6 +47,10 @@ class OpenAICompatLLM(LLMProvider):
         kwargs: dict = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
+        # Retry transient failures (429 / 5xx / connection resets) with the
+        # SDK's exponential backoff (honors Retry-After). A routine rate-limit
+        # blip under load no longer wastes the whole turn on the canned error.
+        kwargs["max_retries"] = settings.JARVIZ_LLM_MAX_RETRIES
         self._client = AsyncOpenAI(**kwargs)
         self._model = model
         self._max_tokens = settings.JARVIZ_LLM_MAX_TOKENS

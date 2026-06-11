@@ -100,10 +100,17 @@ All `JARVIZ_*` env vars are documented in `.env.example`. The ones worth knowing
 |---|---|
 | `DEEPSEEK_API_KEY` | Required when `JARVIZ_LLM_PROVIDER=deepseek` (default) |
 | `JARVIZ_WS_PUBLIC_URL` | The URL the device dials in to. Must match where the Space is reachable. |
+| `JARVIZ_TTS_PACING_ENABLED` | Pace TTS frames to real-time so the device's ~2.4s decode queue never overflows and drops audio (default `true` — leave on). |
+| `JARVIZ_TTS_JITTER_BUFFER_MS` | How far ahead of real-time playback the server may run; also the device's jitter tolerance (default 800, keep under 2400). |
 | `JARVIZ_MAX_SESSIONS` | Idle WebSocket cap (default 64) |
 | `JARVIZ_MAX_CONCURRENT_TURNS` | Active ASR+LLM+TTS cap (default 8) |
 | `JARVIZ_DEVICE_COOLDOWN_S` | Per-device reconnect rate-limit in seconds (default 2.0) |
 | `JARVIZ_AUTH_SECRET` | Set to enable HMAC-signed device tokens. Empty = open (LAN dev default) |
+| `JARVIZ_REQUIRE_AUTH` | Fail closed: refuse to start unless `JARVIZ_AUTH_SECRET` is set (default false). Use in prod. |
+| `JARVIZ_DASHBOARD_TOKEN` | Gate the dashboard + telemetry read surface behind a token (`?token=` / `X-Dashboard-Token` / cookie). Empty = open. **Set this for any internet-exposed deploy.** |
+| `JARVIZ_LLM_MAX_RETRIES` | Retries for transient LLM 429/5xx/connection errors with backoff (default 2) |
+| `JARVIZ_WS_GRACEFUL_SHUTDOWN_S` | Drain in-flight turns this long on SIGTERM before force-closing (default 10) |
+| `JARVIZ_LOG_MESSAGE_TEXT` | Log utterance/reply text (default true). Set false to redact PII in prod logs. |
 | `JARVIZ_WS_PING_INTERVAL_S` / `_TIMEOUT_S` | WebSocket keepalive (default 20/20) |
 
 ## Documentation

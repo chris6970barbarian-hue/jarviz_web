@@ -86,6 +86,13 @@ class EdgeTTS(TTSProvider):
             stderr=asyncio.subprocess.DEVNULL,
         )
 
+        # Captures a real (non-cancellation) failure of the Edge-TTS stream so
+        # the consumer can surface it. Without this, an Edge CDN error / network
+        # drop / NoAudioReceived raised inside comm.stream() was silently
+        # swallowed: ffmpeg saw a clean EOF, synthesize() yielded zero PCM and
+        # "succeeded", and the device just played silence with no log or metric.
+        feeder_error: list[BaseException] = []
+
         async def feed_ffmpeg() -> None:
             try:
                 async for chunk in comm.stream():
@@ -96,6 +103,11 @@ class EdgeTTS(TTSProvider):
                         except (BrokenPipeError, ConnectionResetError):
                             # ffmpeg already exited (e.g. consumer cancelled)
                             return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # Edge upstream failure (403/throttle/NoAudioReceived/network).
+                feeder_error.append(e)
             finally:
                 try:
                     ff.stdin.close()
@@ -103,12 +115,14 @@ class EdgeTTS(TTSProvider):
                     pass
 
         feeder = asyncio.create_task(feed_ffmpeg())
+        produced = 0
         try:
             chunk_size = 4096
             while True:
                 pcm = await ff.stdout.read(chunk_size)
                 if not pcm:
                     break
+                produced += len(pcm)
                 yield pcm
         finally:
             # If the consumer cancelled or raised mid-stream, cancel the
@@ -119,8 +133,19 @@ class EdgeTTS(TTSProvider):
                 feeder.cancel()
             try:
                 await feeder
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception as e:  # noqa: BLE001
+                feeder_error.append(e)
+            # Surface an upstream Edge-TTS failure loudly. We don't raise (the
+            # session-level TTS handler already sends a clean `tts stop`), but
+            # an operator must be able to tell "the user asked for silence" from
+            # "Edge-TTS broke": the former produces audio, the latter logs here.
+            if feeder_error:
+                log.warning(
+                    "Edge-TTS stream failed (produced %d PCM bytes before failure): %s",
+                    produced, feeder_error[0],
+                )
             if ff.returncode is None:
                 try:
                     ff.terminate()

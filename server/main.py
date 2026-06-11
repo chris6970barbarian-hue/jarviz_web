@@ -84,6 +84,56 @@ async def lifespan(app: FastAPI):
     log.info("Providers initialized: llm=%s asr=%s tts=%s",
              type(llm).__name__, type(asr).__name__, type(tts).__name__)
 
+    # Security-posture guard. Two independent open-by-default surfaces:
+    #   (1) device auth — fails *open* on a routable interface when
+    #       JARVIZ_AUTH_SECRET is empty;
+    #   (2) the dashboard/telemetry read surface — open unless
+    #       JARVIZ_DASHBOARD_TOKEN is set (it leaks transcripts, device IDs,
+    #       peer IPs, logs).
+    # Either is fine on a trusted LAN but a data-leak / paid-LLM-quota faucet if
+    # the port is reachable from an untrusted network. Warn loudly on each, since
+    # both are invisible on a developer's laptop otherwise.
+    from .auth import auth_enabled  # local import: avoids a cycle at module load
+    host = settings.JARVIZ_HTTP_HOST
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    # Fail closed when the operator has opted in: refuse to boot rather than
+    # silently come up with device auth disabled in a deployment that demands it.
+    if settings.JARVIZ_REQUIRE_AUTH and not auth_enabled():
+        raise RuntimeError(
+            "JARVIZ_REQUIRE_AUTH is set but JARVIZ_AUTH_SECRET is empty — "
+            "refusing to start with device auth disabled. Set a secret or "
+            "clear JARVIZ_REQUIRE_AUTH for an intentionally open LAN deploy."
+        )
+    if not auth_enabled():
+        if loopback:
+            log.warning(
+                "Device auth is DISABLED (JARVIZ_AUTH_SECRET empty). OK for "
+                "loopback-only dev; set a secret before exposing this server."
+            )
+        else:
+            log.warning(
+                "SECURITY: device auth is DISABLED and the server is bound to a "
+                "non-loopback interface (%s). Any host that can reach port %s can "
+                "open sessions (burning LLM quota) and read the unauthenticated "
+                "/dashboard, /transcripts/recent and /logs/recent surface. Set "
+                "JARVIZ_AUTH_SECRET, or bind JARVIZ_HTTP_HOST=127.0.0.1, before "
+                "deploying on an untrusted network.",
+                host, settings.JARVIZ_HTTP_PORT,
+            )
+    # Independent of device auth: the operator console + telemetry read surface
+    # is open unless JARVIZ_DASHBOARD_TOKEN is set. Warn when it's open on a
+    # routable bind (this fires even when device auth IS configured).
+    if not settings.JARVIZ_DASHBOARD_TOKEN and not loopback:
+        log.warning(
+            "SECURITY: operator dashboard + telemetry (/dashboard, "
+            "/transcripts/recent, /logs/recent, /sessions/live, /network) are "
+            "UNAUTHENTICATED and bound to a non-loopback interface (%s). Anyone "
+            "who can reach port %s can read conversation transcripts, device "
+            "IDs, peer IPs and logs. Set JARVIZ_DASHBOARD_TOKEN to require an "
+            "operator token.",
+            host, settings.JARVIZ_HTTP_PORT,
+        )
+
     try:
         yield
     finally:

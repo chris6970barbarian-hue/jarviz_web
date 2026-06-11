@@ -42,6 +42,13 @@ class _Counters:
     turns_cancelled: int = 0
     turns_overloaded: int = 0  # got the canned overload reply
 
+    # Per-stage failures — lets an operator distinguish a healthy server from
+    # one quietly failing every LLM/TTS call (which otherwise only shows as a
+    # gap between started and completed). Wire an alert on the rate of these.
+    asr_failed: int = 0
+    llm_failed: int = 0
+    tts_failed: int = 0
+
     # Most recent N turn latencies (as (total_ms, asr_ms, llm_ms, tts_ms)).
     recent_latencies: deque = field(
         default_factory=lambda: deque(maxlen=_LATENCY_RING_SIZE)
@@ -108,6 +115,11 @@ def snapshot() -> dict:
                 "in_flight": _C.turns_started
                 - _C.turns_completed
                 - _C.turns_cancelled,
+            },
+            "failures": {
+                "asr": _C.asr_failed,
+                "llm": _C.llm_failed,
+                "tts": _C.tts_failed,
             },
             "latency_ms": {
                 "samples": len(lats),
