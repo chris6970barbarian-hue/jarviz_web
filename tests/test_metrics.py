@@ -36,6 +36,12 @@ def test_in_flight_derivation():
 
 
 def test_record_turn_latency_and_snapshot_shape():
+    # Clear the latency ring first — other test modules (e.g. test_hardening)
+    # exercise _process_turn end-to-end against stubbed providers that complete
+    # instantly, populating the global ring with (0, 0, 0, 0) tuples. With
+    # those still present, p50 across the sorted samples lands on a zero and
+    # the assertion below ("total_p50 > 0") flakes based on test ordering.
+    metrics._C.recent_latencies.clear()
     metrics.record_turn_latency(total_ms=120, asr_ms=30, llm_ms=70, tts_ms=20)
     snap = metrics.snapshot()
     lat = snap["latency_ms"]
