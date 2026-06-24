@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 
 # How many completed turns the dashboard shows.
@@ -63,6 +63,16 @@ _reminder_counts = {
     "fired_total": 0,          # device sent listen.detect with [Reminder] prefix
 }
 _reminder_buckets: dict[int, dict[str, int]] = {}
+
+# Best-effort mirror of each device's *pending* reminders, so the dashboard
+# can show the actual scheduled list (not just event counts). Learned by
+# snooping on MCP tool results: list_reminders / get_user_name carry a full
+# snapshot (replace), create_reminder* returns the new one (upsert),
+# delete_reminder's id is in the args (drop).
+# device_id -> {reminder_id: {id, text, unix_timestamp, local_time}}
+_REMINDER_MAX_DEVICES = 200
+_REMINDER_DEFAULT_KEY = "_unknown"
+_reminders_by_device: OrderedDict[str, dict[int, dict]] = OrderedDict()
 
 
 def _bucket_for(ts: float) -> int:
@@ -206,9 +216,104 @@ def record_reminder_fired() -> None:
         _trim_buckets()
 
 
+def _coerce_reminder(obj) -> dict | None:
+    """Normalize one reminder object from a device tool result, or None."""
+    if not isinstance(obj, dict):
+        return None
+    rid = obj.get("id")
+    text = obj.get("text")
+    if rid is None or text is None:
+        return None
+    try:
+        rid_int = int(rid)
+    except (TypeError, ValueError):
+        return None
+    ts = obj.get("unix_timestamp")
+    try:
+        ts_int = int(ts) if ts is not None else None
+    except (TypeError, ValueError):
+        ts_int = None
+    return {
+        "id": rid_int,
+        "text": str(text),
+        "unix_timestamp": ts_int,
+        "local_time": str(obj.get("local_time") or ""),
+    }
+
+
+def update_reminders_from_tool(
+    device_id: str, name: str, args: dict | None, payload
+) -> None:
+    """Reconcile our per-device reminder mirror against a tool result.
+    `payload` is the JSON-parsed body of the tool's result text."""
+    if not name:
+        return
+    key = device_id or _REMINDER_DEFAULT_KEY
+    with _lock:
+        store = _reminders_by_device.get(key)
+        if store is None:
+            store = {}
+            _reminders_by_device[key] = store
+        _reminders_by_device.move_to_end(key)
+
+        if name == "jarviz.list_reminders":
+            if isinstance(payload, list):
+                store.clear()
+                for o in payload:
+                    r = _coerce_reminder(o)
+                    if r:
+                        store[r["id"]] = r
+        elif name == "jarviz.get_user_name":
+            if isinstance(payload, dict) and isinstance(
+                payload.get("pending_reminders"), list
+            ):
+                store.clear()
+                for o in payload["pending_reminders"]:
+                    r = _coerce_reminder(o)
+                    if r:
+                        store[r["id"]] = r
+        elif name in ("jarviz.create_reminder", "jarviz.create_reminder_relative"):
+            r = _coerce_reminder(payload)
+            if r:
+                store[r["id"]] = r
+        elif name == "jarviz.delete_reminder":
+            rid = (args or {}).get("id")
+            try:
+                if rid is not None:
+                    store.pop(int(rid), None)
+            except (TypeError, ValueError):
+                pass
+
+        while len(_reminders_by_device) > _REMINDER_MAX_DEVICES:
+            _reminders_by_device.popitem(last=False)
+
+
+def pending_reminders() -> list[dict]:
+    """Flat list of every device's known-pending reminders, soonest first.
+    Each entry has device_id, id, text, unix_timestamp, local_time, and a
+    computed fires_in_s (negative = overdue, None = no timestamp)."""
+    # The device's unix_timestamp is local-wall-clock seconds (its clock runs
+    # TZ=UTC0 with the server-pushed offset folded in via ota.cc). Shift now
+    # into the device's frame so the countdown is right.
+    from .config import settings  # local import to avoid a load cycle
+    now = time.time() + int(settings.JARVIZ_TZ_OFFSET_MINUTES) * 60
+    out: list[dict] = []
+    with _lock:
+        for dev, store in _reminders_by_device.items():
+            dev_label = "" if dev == _REMINDER_DEFAULT_KEY else dev
+            for r in store.values():
+                e = dict(r)
+                e["device_id"] = dev_label
+                ts = e.get("unix_timestamp")
+                e["fires_in_s"] = round(ts - now) if ts else None
+                out.append(e)
+    out.sort(key=lambda e: (e["unix_timestamp"] is None, e.get("unix_timestamp") or 0))
+    return out
+
+
 def reminder_snapshot() -> dict:
-    """Counters + a flat hourly series spanning the last N hours, with
-    zero-fill so the chart can render straight bars without gaps."""
+    """Counters + a flat hourly series spanning the last N hours (zero-filled
+    so the chart has gap-free bars) + the current pending-reminder list."""
     with _lock:
         counts = dict(_reminder_counts)
         now_bucket = _bucket_for(time.time())
@@ -219,4 +324,4 @@ def reminder_snapshot() -> dict:
                 b, {"created": 0, "deleted": 0, "listed": 0, "fired": 0}
             )
             series.append({"bucket": b, **slot})
-    return {"counters": counts, "hourly": series}
+    return {"counters": counts, "hourly": series, "pending": pending_reminders()}

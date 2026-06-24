@@ -128,18 +128,56 @@ STUB_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+# The simulator emulates the device's clock. The real firmware (ota.cc)
+# folds the server-pushed `timezone_offset` into settimeofday(), so the
+# device's epoch is local-wall-clock seconds, and its reminder timestamps
+# are in that frame. We mirror that here so the dashboard's countdown
+# (which corrects back by the same offset) lines up. Set from the OTA
+# response in main().
+_SIM_TZ_OFFSET_MIN = 0
+# In-process reminder store, keyed by id — stands in for the device's NVS
+# so get_user_name / list_reminders return real pending reminders (the
+# previous always-empty stub would wrongly wipe the server's mirror).
+_SIM_REMINDERS: dict[int, dict] = {}
+_SIM_NEXT_ID = 1
+
+
+def _sim_device_now() -> int:
+    """Device-frame epoch seconds (true UTC + the OTA timezone offset),
+    matching what the firmware's clock holds after settimeofday()."""
+    return int(time.time()) + _SIM_TZ_OFFSET_MIN * 60
+
+
+def _sim_local_time(unix_ts: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(unix_ts))
+
+
+def _sim_reminder_list() -> list[dict]:
+    return [
+        {
+            "id": r["id"],
+            "unix_timestamp": r["unix_timestamp"],
+            "local_time": _sim_local_time(r["unix_timestamp"]),
+            "text": r["text"],
+        }
+        for r in sorted(_SIM_REMINDERS.values(), key=lambda x: x["unix_timestamp"])
+    ]
+
+
 def _stub_tool_response(name: str, args: dict) -> dict:
     """Return a minimal MCP `result` dict for the given tool call."""
+    global _SIM_NEXT_ID
     if name == "jarviz.get_user_name":
         # NO hardcoded name — read whatever the simulator last persisted.
         # First run on a fresh checkout returns "" so the LLM exercises
         # its "ask for the name" branch exactly like a real fresh device.
+        now = _sim_device_now()
         text = json.dumps(
             {
                 "name": _sim_get_user_name(),
-                "local_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "unix_timestamp": int(time.time()),
-                "pending_reminders": [],
+                "local_time": _sim_local_time(now),
+                "unix_timestamp": now,
+                "pending_reminders": _sim_reminder_list(),
             }
         )
     elif name == "jarviz.set_user_name":
@@ -147,25 +185,33 @@ def _stub_tool_response(name: str, args: dict) -> dict:
         # their name once — same UX as the real device's NVS.
         _sim_set_user_name(args.get("name", ""))
         text = "true"
+    elif name == "jarviz.get_current_time":
+        now = _sim_device_now()
+        text = json.dumps({"local_time": _sim_local_time(now), "unix_timestamp": now})
     elif name == "jarviz.create_reminder_relative":
+        rid = _SIM_NEXT_ID
+        _SIM_NEXT_ID += 1
+        ts = _sim_device_now() + int(args.get("seconds_from_now", 0))
+        _SIM_REMINDERS[rid] = {"id": rid, "unix_timestamp": ts, "text": args.get("text", "")}
         text = json.dumps(
-            {
-                "id": 1,
-                "unix_timestamp": int(time.time()) + int(args.get("seconds_from_now", 0)),
-                "text": args.get("text", ""),
-            }
+            {"id": rid, "unix_timestamp": ts, "local_time": _sim_local_time(ts), "text": args.get("text", "")}
         )
     elif name == "jarviz.create_reminder":
+        rid = _SIM_NEXT_ID
+        _SIM_NEXT_ID += 1
+        ts = int(args.get("unix_timestamp", 0))
+        _SIM_REMINDERS[rid] = {"id": rid, "unix_timestamp": ts, "text": args.get("text", "")}
         text = json.dumps(
-            {
-                "id": 2,
-                "unix_timestamp": int(args.get("unix_timestamp", 0)),
-                "text": args.get("text", ""),
-            }
+            {"id": rid, "unix_timestamp": ts, "local_time": _sim_local_time(ts), "text": args.get("text", "")}
         )
     elif name == "jarviz.list_reminders":
-        text = "[]"
+        text = json.dumps(_sim_reminder_list())
     elif name == "jarviz.delete_reminder":
+        rid = args.get("id")
+        try:
+            _SIM_REMINDERS.pop(int(rid), None)
+        except (TypeError, ValueError):
+            pass
         text = "true"
     else:
         text = f"unknown tool {name}"
@@ -236,6 +282,16 @@ async def main() -> int:
         ota = r.json()
     print("OTA response:", json.dumps(ota, indent=2))
     ws_url = ota["websocket"]["url"]
+
+    # Mirror the firmware: fold the server-pushed timezone offset into our
+    # emulated device clock so reminder timestamps land in the same frame
+    # the real device produces (ota.cc adds it to settimeofday()).
+    global _SIM_TZ_OFFSET_MIN
+    try:
+        _SIM_TZ_OFFSET_MIN = int(ota["server_time"]["timezone_offset"])
+        print(f"[sim] device clock offset: {_SIM_TZ_OFFSET_MIN} min")
+    except (KeyError, TypeError, ValueError):
+        _SIM_TZ_OFFSET_MIN = 0
 
     # The OTA URL hands out the LAN IP so the real device can reach us. When
     # running the simulator on the same host, force the WS host back to

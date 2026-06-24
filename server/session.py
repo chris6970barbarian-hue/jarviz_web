@@ -98,6 +98,30 @@ def _sanitize_for_tts(text: str) -> str:
     return cleaned.strip()
 
 
+def _mcp_result_payload(result: dict):
+    """Pull the JSON body out of an MCP tools/call result so the dashboard
+    can mirror reminders. MCP results look like
+    `{content: [{type: "text", text: "<json>"}], isError: bool}`; we join
+    the text parts and json.loads them. Returns the parsed value or None."""
+    if not isinstance(result, dict):
+        return None
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [
+        str(item.get("text", ""))
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "text"
+    ]
+    raw = "\n".join(p for p in parts if p).strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+
+
 def _log_text(text: str | None) -> str:
     """Redact free-text in logs when JARVIZ_LOG_MESSAGE_TEXT is off, so a
     production log (and the in-memory ring behind /logs/recent) carries no
@@ -568,14 +592,25 @@ class Session:
                 else:
                     tools = self._mcp.tools
                     t0 = time.monotonic()
-                    # Wrap the MCP call so we can both (a) record reminder-
-                    # related tool calls in the live-state counters used by
-                    # the dashboard chart, and (b) append the tool name to
-                    # the transcript record.
+                    # Wrap the MCP call so we can (a) record reminder-related
+                    # tool calls in the live-state counters, (b) append the
+                    # tool name to the transcript record, and (c) mirror the
+                    # actual reminder list from the tool RESULT so the
+                    # dashboard can show what's scheduled, not just counts.
                     async def _traced_invoke(name: str, args: dict):
                         tool_calls_for_log.append(name)
                         live_state.record_tool_call(name)
-                        return await self._mcp.call_tool(name, args)
+                        result = await self._mcp.call_tool(name, args)
+                        if name.startswith("jarviz."):
+                            try:
+                                payload = _mcp_result_payload(result)
+                                live_state.update_reminders_from_tool(
+                                    self._device_id, name, args, payload
+                                )
+                            except Exception:  # noqa: BLE001
+                                log.debug("reminder mirror failed for %s", name,
+                                          exc_info=True)
+                        return result
                     try:
                         assistant_text, new_history = await self._llm.respond(
                             user_text=user_text,

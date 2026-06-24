@@ -722,6 +722,113 @@ DASHBOARD_HTML = """<!doctype html>
   .chart-legend .sw.deleted { background: var(--st-listening); }
   .chart-legend .sw.listed  { background: var(--st-idle); }
 
+  /* ---------- Reminders: scheduled list + activity blocks ---------- */
+  .rem-block { margin-top: 22px; }
+  .rem-block:first-of-type { margin-top: 18px; }
+  .rem-block-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .rem-block-head > span:first-child {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    color: var(--fg-dim);
+  }
+  .rem-count {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+  }
+
+  .rem-list { display: flex; flex-direction: column; gap: 8px; }
+
+  .rem-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 18px;
+    padding: 15px 20px;
+    background: var(--bg-surface);
+    border: 1px solid var(--rule);
+    border-left-width: 2px;
+    border-radius: 3px;
+    transition: border-color 0.3s, background 0.3s;
+  }
+  /* Urgency drives the left border + dot colour. */
+  .rem-row[data-urgency="imminent"] { border-left-color: var(--st-listening); }
+  .rem-row[data-urgency="soon"]     { border-left-color: var(--st-processing); }
+  .rem-row[data-urgency="later"]    { border-left-color: var(--st-speaking); }
+  .rem-row[data-urgency="overdue"]  { border-left-color: var(--fg-faint); }
+  .rem-row[data-urgency="none"]     { border-left-color: var(--rule-strong); }
+
+  .rem-dot {
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    background: var(--st-idle);
+  }
+  .rem-row[data-urgency="imminent"] .rem-dot {
+    background: var(--st-listening);
+    box-shadow: 0 0 10px rgba(232,99,74,0.55);
+    animation: pulse-cool 1.1s ease-in-out infinite;
+  }
+  .rem-row[data-urgency="soon"]    .rem-dot { background: var(--st-processing); box-shadow: 0 0 8px var(--warm-soft); }
+  .rem-row[data-urgency="later"]   .rem-dot { background: var(--st-speaking); }
+  .rem-row[data-urgency="overdue"] .rem-dot { background: var(--fg-faint); }
+
+  .rem-body { min-width: 0; }
+  .rem-text {
+    font-family: var(--font-display);
+    font-weight: 400;
+    font-size: 18px;
+    line-height: 1.25;
+    color: var(--fg);
+    font-variation-settings: 'opsz' 40;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .rem-row[data-urgency="overdue"] .rem-text { color: var(--fg-dim); }
+  .rem-sub {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    color: var(--fg-faint);
+    margin-top: 3px;
+  }
+  .rem-when { text-align: right; white-space: nowrap; }
+  .rem-countdown {
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+  }
+  .rem-row[data-urgency="imminent"] .rem-countdown { color: var(--st-listening); }
+  .rem-row[data-urgency="soon"]     .rem-countdown { color: var(--st-processing); }
+  .rem-row[data-urgency="later"]    .rem-countdown { color: var(--st-speaking); }
+  .rem-row[data-urgency="overdue"]  .rem-countdown { color: var(--fg-faint); }
+  .rem-abs {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    color: var(--fg-faint);
+    margin-top: 3px;
+  }
+
+  .rem-empty {
+    padding: 34px 20px;
+    text-align: center;
+    background: var(--bg-surface);
+    border: 1px dashed var(--rule-strong);
+    border-radius: 3px;
+  }
+  .rem-empty .empty-title { font-size: 18px; margin-bottom: 8px; }
+
   /* ---------- Live log ---------- */
   .log {
     background: var(--bg-inset);
@@ -852,32 +959,50 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
   </div>
 
-  <!-- III. REMINDERS CHART -->
+  <!-- III. REMINDERS -->
   <section>
     <div class="sec-head">
       <span class="sec-num">III</span>
       <h2 class="sec-title">Reminders</h2>
-      <span class="sec-aside">last 48 hours</span>
+      <span class="sec-aside" id="remAside"></span>
     </div>
+
     <div class="chart-counters">
       <div class="ctr created"><span class="ctr-label">Created</span><span class="ctr-value" id="ctCreated">0</span></div>
       <div class="ctr fired"><span class="ctr-label">Fired</span><span class="ctr-value" id="ctFired">0</span></div>
       <div class="ctr deleted"><span class="ctr-label">Deleted</span><span class="ctr-value" id="ctDeleted">0</span></div>
     </div>
-    <div class="chart-frame">
-      <svg class="chart-svg" id="chart" viewBox="0 0 1000 160" preserveAspectRatio="none"></svg>
-      <div class="chart-axis">
-        <span>−48h</span>
-        <span>−36h</span>
-        <span>−24h</span>
-        <span>−12h</span>
-        <span>now</span>
+
+    <!-- Scheduled list — the actual pending reminders -->
+    <div class="rem-block">
+      <div class="rem-block-head">
+        <span>Scheduled</span>
+        <span class="rem-count" id="remCount"></span>
       </div>
-      <div class="chart-legend">
-        <span><span class="sw created"></span>Created</span>
-        <span><span class="sw fired"></span>Fired</span>
-        <span><span class="sw deleted"></span>Deleted</span>
-        <span><span class="sw listed"></span>Listed</span>
+      <div class="rem-list" id="remList"></div>
+    </div>
+
+    <!-- Activity over the last 48 hours -->
+    <div class="rem-block">
+      <div class="rem-block-head">
+        <span>Activity</span>
+        <span class="rem-count">last 48 hours</span>
+      </div>
+      <div class="chart-frame">
+        <svg class="chart-svg" id="chart" viewBox="0 0 1000 120" preserveAspectRatio="none"></svg>
+        <div class="chart-axis">
+          <span>−48h</span>
+          <span>−36h</span>
+          <span>−24h</span>
+          <span>−12h</span>
+          <span>now</span>
+        </div>
+        <div class="chart-legend">
+          <span><span class="sw created"></span>Created</span>
+          <span><span class="sw fired"></span>Fired</span>
+          <span><span class="sw deleted"></span>Deleted</span>
+          <span><span class="sw listed"></span>Listed</span>
+        </div>
       </div>
     </div>
   </section>
@@ -1047,15 +1172,84 @@ DASHBOARD_HTML = """<!doctype html>
     if (stick) el.scrollTop = el.scrollHeight;
   }
 
+  function remUrgency(s) {
+    if (s == null) return 'none';
+    if (s < 0) return 'overdue';
+    if (s < 60) return 'imminent';
+    if (s < 3600) return 'soon';
+    return 'later';
+  }
+
+  function fmtCountdown(s) {
+    if (s == null) return 'no time set';
+    if (s < 0) return 'overdue';
+    if (s < 60) return 'in ' + Math.max(1, Math.round(s)) + 's';
+    if (s < 3600) return 'in ' + Math.floor(s / 60) + 'm';
+    if (s < 86400) {
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+      return 'in ' + h + 'h' + (m ? ' ' + m + 'm' : '');
+    }
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+    return 'in ' + d + 'd' + (h ? ' ' + h + 'h' : '');
+  }
+
+  function fmtRemAbs(r) {
+    // Prefer the device's own local_time string; fall back to deriving a
+    // clock time from the unix timestamp.
+    if (r.local_time) {
+      const t = String(r.local_time).split('T')[1];
+      if (t) return t.slice(0, 5);   // HH:MM
+      return r.local_time;
+    }
+    if (r.unix_timestamp) return fmtClockTime(r.unix_timestamp);
+    return '';
+  }
+
+  function renderReminderList(pending) {
+    const list = $('remList');
+    const count = pending ? pending.length : 0;
+    $('remCount').textContent = count === 0 ? '' : count + (count === 1 ? ' pending' : ' pending');
+    if (count === 0) {
+      list.innerHTML = '<div class="rem-empty">'
+        + '<div class="empty-title">Nothing scheduled</div>'
+        + '<div class="empty-sub">Say &ldquo;remind me to&hellip;&rdquo; to the device</div>'
+        + '</div>';
+      return;
+    }
+    list.innerHTML = pending.map(r => {
+      const u = remUrgency(r.fires_in_s);
+      const dev = r.device_id ? shortDevice(r.device_id) : 'device';
+      const abs = fmtRemAbs(r);
+      const subBits = [dev];
+      if (abs) subBits.push(abs);
+      return '<div class="rem-row" data-urgency="' + esc(u) + '">'
+        + '<span class="rem-dot"></span>'
+        + '<div class="rem-body">'
+        +   '<div class="rem-text">' + esc(r.text || '(untitled)') + '</div>'
+        +   '<div class="rem-sub">#' + esc(r.id) + ' &middot; ' + esc(subBits.join(' \\u00b7 ')) + '</div>'
+        + '</div>'
+        + '<div class="rem-when">'
+        +   '<div class="rem-countdown">' + esc(fmtCountdown(r.fires_in_s)) + '</div>'
+        +   (abs ? '<div class="rem-abs">' + esc(abs) + '</div>' : '')
+        + '</div>'
+        + '</div>';
+    }).join('');
+  }
+
   function renderReminders(data) {
     const counters = (data && data.counters) || {};
     $('ctCreated').textContent = fmtInt(counters.created_total || 0);
     $('ctFired').textContent   = fmtInt(counters.fired_total   || 0);
     $('ctDeleted').textContent = fmtInt(counters.deleted_total || 0);
 
+    renderReminderList((data && data.pending) || []);
+    const pc = data && data.pending ? data.pending.length : 0;
+    $('remAside').textContent = pc === 0 ? 'none scheduled'
+      : pc + (pc === 1 ? ' scheduled' : ' scheduled');
+
     const hourly = (data && data.hourly) || [];
     const svg = $('chart');
-    const W = 1000, H = 160, padX = 4, padY = 8;
+    const W = 1000, H = 120, padX = 4, padY = 8;
     const n = hourly.length || 1;
     const colW = (W - padX * 2) / n;
     const innerH = H - padY * 2;
